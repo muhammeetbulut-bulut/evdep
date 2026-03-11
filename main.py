@@ -2,6 +2,7 @@ import requests
 import time
 import math
 import os
+from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -64,7 +65,6 @@ def fetch_venue(team_id, venue="home", n=10):
 
 
 def fetch_h2h(id1, id2, n=8):
-    from datetime import datetime, timezone
     r = safe_get(API_URL + "/fixtures/headtohead?h2h=" + str(id1) + "-" + str(id2) + "&last=" + str(n))
     if not r:
         return []
@@ -157,7 +157,10 @@ def analyze_team(gen_matches, ven_matches, team_id):
         return None
 
     gf, ga, h1_gf, h1_ga, h2_gf, h2_ga, fids = parse_matches(gen_matches, team_id)
-    vgf, vga, vh1_gf, vh1_ga, vh2_gf, vh2_ga, _ = parse_matches(ven_matches, team_id) if ven_matches else ([], [], [], [], [], [], [])
+    if ven_matches:
+        vgf, vga, vh1_gf, vh1_ga, vh2_gf, vh2_ga, _ = parse_matches(ven_matches, team_id)
+    else:
+        vgf, vga, vh1_gf, vh1_ga, vh2_gf, vh2_ga = [], [], [], [], [], []
 
     xg = fetch_xg(team_id, fids)
 
@@ -165,7 +168,6 @@ def analyze_team(gen_matches, ven_matches, team_id):
         return sum(1 for x in lst if x > 0) / len(lst) if lst else 0.0
 
     w_gf = weighted_avg(gf) * 0.5 + (weighted_avg(vgf) if vgf else weighted_avg(gf)) * 0.5
-    w_ga = weighted_avg(ga) * 0.5 + (weighted_avg(vga) if vga else weighted_avg(ga)) * 0.5
     h1_gf_r = rate(h1_gf) * 0.5 + (rate(vh1_gf) if vh1_gf else rate(h1_gf)) * 0.5
     h1_ga_r = rate(h1_ga) * 0.5 + (rate(vh1_ga) if vh1_ga else rate(h1_ga)) * 0.5
     h2_gf_r = rate(h2_gf) * 0.5 + (rate(vh2_gf) if vh2_gf else rate(h2_gf)) * 0.5
@@ -173,10 +175,8 @@ def analyze_team(gen_matches, ven_matches, team_id):
 
     lam_attack = w_gf * 0.5 + xg * 0.3 + h1_gf_r * 0.1 + h2_gf_r * 0.1
     poisson_conf = poisson_over(lam_attack, 1.5)
-
     trend_score = w_gf * 0.45 + h1_gf_r * 0.2 + h2_gf_r * 0.2 + xg * 0.15
     logistic_conf = logistic(trend_score - 1.5)
-
     combined = poisson_conf * 0.5 + logistic_conf * 0.5
     over_conf = int(round(combined * 100))
     under_conf = 100 - over_conf
@@ -199,31 +199,22 @@ def analyze_h2h(h2h_matches, home_id, away_id):
     if not h2h_matches:
         return None
     totals = []
-    home_over = 0
-    away_over = 0
+    home_over, away_over = 0, 0
     for m in h2h_matches:
         gh = m["goals"]["home"] or 0
         ga = m["goals"]["away"] or 0
-        total = gh + ga
-        totals.append(total)
+        totals.append(gh + ga)
         mhid = m["teams"]["home"]["id"]
-        maid = m["teams"]["away"]["id"]
         if mhid == home_id:
-            if gh > 1:
-                home_over += 1
-            if ga > 1:
-                away_over += 1
+            if gh > 1: home_over += 1
+            if ga > 1: away_over += 1
         else:
-            if ga > 1:
-                home_over += 1
-            if gh > 1:
-                away_over += 1
+            if ga > 1: home_over += 1
+            if gh > 1: away_over += 1
     n = len(totals)
-    avg = sum(totals) / n
-    over15_rate = sum(1 for t in totals if t > 1) / n
     return {
-        "avg_total": round(avg, 2),
-        "over15_rate": round(over15_rate * 100),
+        "avg_total": round(sum(totals) / n, 2),
+        "over15_rate": round(sum(1 for t in totals if t > 1) / n * 100),
         "home_over_rate": round(home_over / n * 100),
         "away_over_rate": round(away_over / n * 100),
         "n": n,
@@ -314,13 +305,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     await update.message.reply_text(
-        "Welcome!\n"
-        "Home/Away 1.5 Over/Under Analysis\n"
-        "Use /analiz to start."
+        "Welcome!\nHome/Away 1.5 Over/Under Analysis\nUse /analysis to start."
     )
 
 
-async def analiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     await update.message.reply_text("\U0001f3f3\ufe0f: Please enter Home Team Name")
@@ -363,7 +352,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("\U0001f3f3\ufe0f: Please enter Home Team Name")
         return HOME
     elif query.data == "close":
-        await query.edit_message_text("Bot closed.\nUse /analiz to restart.")
+        await query.edit_message_text("Bot closed.\nUse /analysis to restart.")
         return ConversationHandler.END
 
 
@@ -372,13 +361,22 @@ def run_bot():
         try:
             app = Application.builder().token(BOT_TOKEN).build()
             conv = ConversationHandler(
-                entry_points=[CommandHandler("analiz", analiz_cmd)],
+                entry_points=[
+                    CommandHandler("analysis", analysis_cmd),
+                    CommandHandler("analiz", analysis_cmd),
+                ],
                 states={
-                    HOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, home_team)],
-                    AWAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, away_team)],
+                    HOME: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, home_team),
+                        CallbackQueryHandler(button_handler, pattern="^again$"),
+                    ],
+                    AWAY: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, away_team),
+                    ],
                 },
-                fallbacks=[],
+                fallbacks=[CommandHandler("analysis", analysis_cmd)],
                 per_message=False,
+                allow_reentry=True,
             )
             app.add_handler(CommandHandler("start", start_cmd))
             app.add_handler(conv)
