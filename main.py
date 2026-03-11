@@ -3,7 +3,6 @@ import numpy as np
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, ConversationHandler, CallbackQueryHandler
 
-# ---- Credentials ----
 BOT_TOKEN = "8688455737:AAENmxT4dn8LoExD-XRcS6J3noLIscBMeQo"
 ADMIN_ID = 8480843841
 API_KEY = "0c0clad20573b309924dd3d7b1bc3e62"
@@ -11,7 +10,19 @@ API_URL = "https://v3.football.api-sports.io"
 
 HOME, AWAY = range(2)
 
-# ---- Analysis Functions ----
+# ---- Team Search ----
+def search_team(name):
+    url = f"{API_URL}/teams?search={name}"
+    headers = {"x-apisports-key": API_KEY}
+    r = requests.get(url, headers=headers, timeout=10)
+    if r.status_code != 200: return None
+    resp = r.json().get("response", [])
+    if not resp: return None
+    # return first match name + id
+    team = resp[0]['team']
+    return team['id'], team['name']
+
+# ---- Fetch Matches ----
 def fetch_last_matches(team_id, N=10):
     url = f"{API_URL}/fixtures?team={team_id}&last={N}"
     headers = {"x-apisports-key": API_KEY}
@@ -20,9 +31,9 @@ def fetch_last_matches(team_id, N=10):
         return []
     return r.json().get("response", [])
 
+# ---- Compute Metrics ----
 def compute_metrics(matches, team_id, alpha=0.7):
-    if not matches:
-        return {}
+    if not matches: return {}
     gf, ga, h1_gf, h1_ga, h2_gf, h2_ga = [], [], [], [], [], []
     for m in matches:
         home_id = m['teams']['home']['id']
@@ -33,7 +44,6 @@ def compute_metrics(matches, team_id, alpha=0.7):
         h1_away = m['score']['halftime']['away']
         h2_home = home_goals - h1_home
         h2_away = away_goals - h1_away
-
         if team_id == home_id:
             gf.append(home_goals); ga.append(away_goals)
             h1_gf.append(h1_home); h1_ga.append(h1_away)
@@ -42,7 +52,6 @@ def compute_metrics(matches, team_id, alpha=0.7):
             gf.append(away_goals); ga.append(home_goals)
             h1_gf.append(h1_away); h1_ga.append(h1_home)
             h2_gf.append(h2_away); h2_ga.append(h2_home)
-
     weights = np.array([alpha**i for i in range(len(gf))])
     weights = weights/weights.sum()
     return {
@@ -56,24 +65,16 @@ def compute_metrics(matches, team_id, alpha=0.7):
         "Weighted_GA": float(np.dot(weights, ga))
     }
 
+# ---- Run Analysis ----
 def run_analysis(home_name, away_name):
-    def search_team(name):
-        url = f"{API_URL}/teams?search={name}"
-        headers = {"x-apisports-key": API_KEY}
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code != 200: return None
-        resp = r.json().get("response", [])
-        return resp[0]['team']['id'] if resp else None
-
-    home_id = search_team(home_name)
-    away_id = search_team(away_name)
+    home_id, home_real = search_team(home_name) or (None, None)
+    away_id, away_real = search_team(away_name) or (None, None)
     if not home_id or not away_id:
         return "Error: team not found", "0%"
 
     home_metrics = compute_metrics(fetch_last_matches(home_id, N=10), home_id)
     away_metrics = compute_metrics(fetch_last_matches(away_id, N=10), away_id)
 
-    # --- Decision logic ---
     score_home = home_metrics.get("Weighted_GF",0) + home_metrics.get("H1_GF_rate",0) + home_metrics.get("H2_GF_rate",0)
     score_away = away_metrics.get("Weighted_GF",0) + away_metrics.get("H1_GF_rate",0) + away_metrics.get("H2_GF_rate",0)
 
@@ -83,18 +84,17 @@ def run_analysis(home_name, away_name):
         option = "AWAY 1.5 OVER ✅"; confidence = "78%"
     else:
         option = "UNDER 1.5 ⚠️"; confidence = "65%"
+
     return option, confidence
 
 # ---- Bot Flow ----
 def start(update, context):
-    if update.effective_user.id != ADMIN_ID:
-        return
+    if update.effective_user.id != ADMIN_ID: return
     update.message.reply_text("Welcome to the Analysis Bot 👋")
     update.message.reply_text("ℹ️: Home/Away 1.5 Over/Under Analysis → /analiz")
 
 def analiz(update, context):
-    if update.effective_user.id != ADMIN_ID:
-        return
+    if update.effective_user.id != ADMIN_ID: return
     update.message.reply_text("🏳️: Please enter Home Team Name")
     return HOME
 
@@ -106,11 +106,9 @@ def home_team(update, context):
 def away_team(update, context):
     context.user_data['away'] = update.message.text
     update.message.reply_text("🛜: Analysis started, please wait...")
-
     home = context.user_data['home']
     away = context.user_data['away']
     option, confidence = run_analysis(home, away)
-
     msg = (
         f"MATCH ANALYSIS RESULT 🔥\n"
         f"🏳️: {home}\n"
