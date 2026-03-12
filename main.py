@@ -24,7 +24,6 @@ def safe_get(url):
         try:
             r = requests.get(url, headers=headers, timeout=15)
             if r.status_code == 200:
-                # Rate limit kontrolü (150k kota için ekstra güvenlik)
                 if "x-ratelimit-requests-remaining" in r.headers:
                     remaining = int(r.headers["x-ratelimit-requests-remaining"])
                     if remaining < 5000:
@@ -39,35 +38,22 @@ def safe_get(url):
 def search_team(name):
     r = safe_get(API_URL + "/teams?search=" + name)
     if not r or not r.get("response"):
-        return None, None, None
+        return None, None
     team = r["response"][0]["team"]
-    return team["id"], team["name"], None  # league_id sonradan alınacak
-
-
-def get_league_id(team_id):
-    r = safe_get(API_URL + f"/leagues?team={team_id}&season=2025")
-    if r and r.get("response"):
-        return r["response"][0]["league"]["id"]
-    return None
+    return team["id"], team["name"]
 
 
 def fetch_season_stats(team_id):
-    league_id = get_league_id(team_id)
-    if not league_id:
-        return {"season_gf": 1.5, "season_ga": 1.4, "possession": 50, "over15": 55}
-    
-    r = safe_get(API_URL + f"/teams/statistics?team={team_id}&season=2025&league={league_id}")
+    r = safe_get(API_URL + f"/teams/statistics?team={team_id}&season=2025")
     if not r or not r.get("response"):
-        return {"season_gf": 1.5, "season_ga": 1.4, "possession": 50, "over15": 55}
+        return {"season_gf": 1.5, "season_ga": 1.4, "possession": 50}
     
     resp = r["response"]
-    gf = resp.get("goals", {}).get("for", {}).get("average", {}).get("total", 1.5) or 1.5
-    ga = resp.get("goals", {}).get("against", {}).get("average", {}).get("total", 1.4) or 1.4
-    poss = resp.get("average", {}).get("possession", 50) or 50
+    season_gf = float(resp.get("goals", {}).get("for", {}).get("average", {}).get("total") or 1.5)
+    season_ga = float(resp.get("goals", {}).get("against", {}).get("average", {}).get("total") or 1.4)
+    poss = float(resp.get("possession") or 50)
     
-    # API'de Goals Over/Under varsa kullan, yoksa default
-    over15 = 55
-    return {"season_gf": round(gf, 2), "season_ga": round(ga, 2), "possession": poss, "over15": over15}
+    return {"season_gf": round(season_gf, 2), "season_ga": round(season_ga, 2), "possession": poss}
 
 
 def fetch_last(team_id, n=15):
@@ -122,9 +108,8 @@ def fetch_xg(team_id, fixture_ids):
             inside = st.get("Shots insidebox", 0)
             on_target = st.get("Shots on Goal", 0)
             outside = st.get("Shots outsidebox", 0)
-            possession = st.get("Ball Possession", 50) / 100
+            possession = st.get("Ball Possession", 50) / 100 if "Ball Possession" in st else 0.5
             
-            # Geliştirilmiş XG (possession ağırlıklı)
             xg_proxy = (inside * 0.14 + on_target * 0.24 + outside * 0.05 + possession * 0.8)
             xg_vals.append(xg_proxy)
         time.sleep(0.6)
@@ -135,7 +120,7 @@ def weighted_avg(values, alpha=ALPHA):
     if not values:
         return 0.0
     w, ws, tw = 1.0, 0.0, 0.0
-    for v in values:  # en yeni maç en yüksek ağırlık
+    for v in values:
         ws += v * w
         tw += w
         w *= alpha
@@ -197,14 +182,13 @@ def analyze_team(gen_matches, ven_matches, team_id):
     h1_gf_r = rate(h1_gf) * 0.5 + (rate(vh1_gf) if vh1_gf else rate(h1_gf)) * 0.5
     h2_gf_r = rate(h2_gf) * 0.5 + (rate(vh2_gf) if vh2_gf else rate(h2_gf)) * 0.5
 
-    # Lig ortalaması + possession blend (en güçlü kısım)
     lam_attack = (
         w_gf * 0.40 +
         xg * 0.25 +
-        h1_gf_r * 0.20 +      # ilk yarı çok kritik
+        h1_gf_r * 0.20 +
         h2_gf_r * 0.10 +
-        (season["season_gf"] * 0.05) +
-        (season["possession"] / 100 * 0.05)
+        (season["season_gf"] * 0.03) +
+        (season["possession"] / 100 * 0.02)
     )
 
     poisson_conf = poisson_over(lam_attack, 1.5)
@@ -220,7 +204,7 @@ def analyze_team(gen_matches, ven_matches, team_id):
         "under_conf": under_conf,
         "lam": round(lam_attack, 2),
         "xG": xg,
-        "GF_avg": round(sum(gf) / len(gf), 2),
+        "GF_avg": round(sum(gf) / len(gf), 2) if gf else 0,
         "H1_GF": round(h1_gf_r * 100),
         "H2_GF": round(h2_gf_r * 100),
     }
@@ -230,15 +214,12 @@ def analyze_h2h(h2h_matches, home_id, away_id):
     if not h2h_matches:
         return None
     h2h_matches.sort(key=lambda m: m["fixture"]["date"], reverse=True)
-    totals = [ (m["goals"]["home"] or 0) + (m["goals"]["away"] or 0) for m in h2h_matches ]
+    totals = [(m["goals"]["home"] or 0) + (m["goals"]["away"] or 0) for m in h2h_matches]
     n = len(totals)
     over15_list = [1 if t > 1 else 0 for t in totals]
     weighted_over = round(weighted_avg(over15_list) * 100)
     
-    return {
-        "over15_rate": weighted_over,
-        "n": n,
-    }
+    return {"over15_rate": weighted_over, "n": n}
 
 
 def blend_with_h2h(team_res, h2h_res, is_home):
@@ -273,8 +254,8 @@ def reliability_label(conf):
 
 
 def run_analysis(home_name, away_name):
-    home_id, home_real, _ = search_team(home_name)
-    away_id, away_real, _ = search_team(away_name)
+    home_id, home_real = search_team(home_name)
+    away_id, away_real = search_team(away_name)
     if not home_id or not away_id:
         return None, None, None, None
 
@@ -300,63 +281,73 @@ def format_msg(home_name, away_name, home_res, away_res):
     marker = "[+]" if "OVER" in option else "[-]"
 
     msg = "MATCH ANALYSIS RESULT 🔥\n\n"
-    msg += "🏳️: " + home_name + "\n"
+    msg += "🏠: " + home_name + "\n"
     msg += "🚩: " + away_name + "\n"
-    msg += "ℹ️: Most Reliable Option [ %" + str(conf) + " ]\n"
-    msg += "⚽: " + option + " " + marker + "\n"
-    msg += "📊: Reliability [ " + reliability + " ]"
+    msg += "ℹ️ Most Reliable Option [% " + str(conf) + " ]\n"
+    msg += "⚽ " + option + " " + marker + "\n"
+    msg += "📊 Reliability [" + reliability + "]"
     return msg
 
 
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Tekrar Analiz Et", callback_data="again")],
-        [InlineKeyboardButton("Botu Kapat", callback_data="close")]
+        [InlineKeyboardButton("Analyze Another Match", callback_data="again")],
+        [InlineKeyboardButton("Close Bot", callback_data="close")]
     ])
 
 
-# Telegram handler'lar (button fix dahil)
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("Hoş geldin! /analysis yazarak başla.")
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text(
+        "Welcome!\nHome/Away 1.5 Over/Under Analysis\nUse /analysis to start."
+    )
+
 
 async def analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("🏳️: Ev Sahibi Takım Adı Gir")
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text("🏠 Please enter Home Team Name")
     return HOME
+
 
 async def home_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["home"] = update.message.text.strip()
-    await update.message.reply_text("🚩: Deplasman Takım Adı Gir")
+    await update.message.reply_text("🚩 Please enter Away Team Name")
     return AWAY
+
 
 async def away_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["away"] = update.message.text.strip()
-    wait = await update.message.reply_text("📊: Analiz yapılıyor, bekle...")
+    wait = await update.message.reply_text("🛜 Analyzing, please wait...")
     home = context.user_data["home"]
     away = context.user_data["away"]
 
     home_real, away_real, home_res, away_res = run_analysis(home, away)
 
-    if not home_real or not away_real:
-        await wait.edit_text("Takım bulunamadı. Tam İngilizce isim kullan (ör: Real Madrid, Fenerbahce)")
+    if not home_real or not away_real or not home_res or not away_res:
+        await wait.edit_text(
+            "Team not found or API error.\nPlease use full English team names.\nExample: Real Madrid, Manchester City, Fenerbahce",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data="again")]])
+        )
         return ConversationHandler.END
 
     msg = format_msg(home_real, away_real, home_res, away_res)
     await wait.edit_text(msg, reply_markup=main_keyboard())
     return ConversationHandler.END
 
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
-        await query.answer("Yetkisiz!")
+        await query.answer("Unauthorized.")
         return ConversationHandler.END
     await query.answer()
     if query.data == "again":
-        await query.edit_message_text("🏳️: Ev Sahibi Takım Adı Gir")
+        await query.edit_message_text("🏠 Please enter Home Team Name")
         return HOME
     elif query.data == "close":
-        await query.edit_message_text("Bot kapatıldı. Tekrar /analysis yaz.")
+        await query.edit_message_text("Bot closed.\nUse /analysis to restart.")
         return ConversationHandler.END
 
 
@@ -365,12 +356,19 @@ def run_bot():
         try:
             app = Application.builder().token(BOT_TOKEN).build()
             conv = ConversationHandler(
-                entry_points=[CommandHandler("analysis", analysis_cmd), CommandHandler("analiz", analysis_cmd)],
+                entry_points=[
+                    CommandHandler("analysis", analysis_cmd),
+                    CommandHandler("analiz", analysis_cmd),
+                ],
                 states={
-                    HOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, home_team),
-                           CallbackQueryHandler(button_handler, pattern="^again$")],
-                    AWAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, away_team),
-                           CallbackQueryHandler(button_handler, pattern="^again$")],
+                    HOME: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, home_team),
+                        CallbackQueryHandler(button_handler, pattern="^again$"),
+                    ],
+                    AWAY: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, away_team),
+                        CallbackQueryHandler(button_handler, pattern="^again$"),
+                    ],
                 },
                 fallbacks=[CommandHandler("analysis", analysis_cmd)],
                 per_message=False,
@@ -379,10 +377,10 @@ def run_bot():
             app.add_handler(CommandHandler("start", start_cmd))
             app.add_handler(conv)
             app.add_handler(CallbackQueryHandler(button_handler))
-            print("BOT ÇALIŞIYOR - 150K İstek Güçlendirilmiş Versiyon")
+            print("GOALREPORT BOT RUNNING - English Messages")
             app.run_polling(drop_pending_updates=True)
         except Exception as e:
-            print("Restart: " + str(e))
+            print("RESTART: " + str(e))
             time.sleep(5)
 
 
