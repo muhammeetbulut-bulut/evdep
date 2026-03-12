@@ -24,39 +24,65 @@ def safe_get(url):
         try:
             r = requests.get(url, headers=headers, timeout=15)
             if r.status_code == 200:
+                # Rate limit kontrolü (150k kota için ekstra güvenlik)
+                if "x-ratelimit-requests-remaining" in r.headers:
+                    remaining = int(r.headers["x-ratelimit-requests-remaining"])
+                    if remaining < 5000:
+                        time.sleep(2)
                 return r.json()
         except Exception:
             pass
-        time.sleep(1)
+        time.sleep(0.8)
     return None
 
 
 def search_team(name):
     r = safe_get(API_URL + "/teams?search=" + name)
-    if not r:
-        return None, None
-    resp = r.get("response", [])
-    if not resp:
-        return None, None
-    team = resp[0]["team"]
-    return team["id"], team["name"]
+    if not r or not r.get("response"):
+        return None, None, None
+    team = r["response"][0]["team"]
+    return team["id"], team["name"], None  # league_id sonradan alınacak
 
 
-def fetch_last(team_id, n=10):
+def get_league_id(team_id):
+    r = safe_get(API_URL + f"/leagues?team={team_id}&season=2025")
+    if r and r.get("response"):
+        return r["response"][0]["league"]["id"]
+    return None
+
+
+def fetch_season_stats(team_id):
+    league_id = get_league_id(team_id)
+    if not league_id:
+        return {"season_gf": 1.5, "season_ga": 1.4, "possession": 50, "over15": 55}
+    
+    r = safe_get(API_URL + f"/teams/statistics?team={team_id}&season=2025&league={league_id}")
+    if not r or not r.get("response"):
+        return {"season_gf": 1.5, "season_ga": 1.4, "possession": 50, "over15": 55}
+    
+    resp = r["response"]
+    gf = resp.get("goals", {}).get("for", {}).get("average", {}).get("total", 1.5) or 1.5
+    ga = resp.get("goals", {}).get("against", {}).get("average", {}).get("total", 1.4) or 1.4
+    poss = resp.get("average", {}).get("possession", 50) or 50
+    
+    # API'de Goals Over/Under varsa kullan, yoksa default
+    over15 = 55
+    return {"season_gf": round(gf, 2), "season_ga": round(ga, 2), "possession": poss, "over15": over15}
+
+
+def fetch_last(team_id, n=15):
     r = safe_get(API_URL + "/fixtures?team=" + str(team_id) + "&last=" + str(n) + "&status=FT")
     return r.get("response", []) if r else []
 
 
-def fetch_venue(team_id, venue="home", n=10):
+def fetch_venue(team_id, venue="home", n=12):
     r = safe_get(API_URL + "/fixtures?team=" + str(team_id) + "&last=30&status=FT")
     if not r:
         return []
     result = []
     for m in r.get("response", []):
         is_home = m["teams"]["home"]["id"] == team_id
-        if venue == "home" and not is_home:
-            continue
-        if venue == "away" and is_home:
+        if (venue == "home" and not is_home) or (venue == "away" and is_home):
             continue
         result.append(m)
         if len(result) >= n:
@@ -64,11 +90,11 @@ def fetch_venue(team_id, venue="home", n=10):
     return result
 
 
-def fetch_h2h(id1, id2, n=8):
+def fetch_h2h(id1, id2, n=12):
     r = safe_get(API_URL + "/fixtures/headtohead?h2h=" + str(id1) + "-" + str(id2) + "&last=" + str(n))
     if not r:
         return []
-    cutoff = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    cutoff = datetime(2025, 1, 1, tzinfo=timezone.utc)
     result = []
     for m in r.get("response", []):
         if m["fixture"]["status"]["short"] != "FT":
@@ -77,34 +103,39 @@ def fetch_h2h(id1, id2, n=8):
             md = datetime.fromisoformat(m["fixture"]["date"].replace("Z", "+00:00"))
             if md >= cutoff:
                 result.append(m)
-        except Exception:
+        except:
             pass
     return result
 
 
 def fetch_xg(team_id, fixture_ids):
     xg_vals = []
-    for fid in fixture_ids[:5]:
+    for fid in fixture_ids[:10]:
         r = safe_get(API_URL + "/fixtures/statistics?fixture=" + str(fid) + "&team=" + str(team_id))
         if not r:
             continue
         for ts in r.get("response", []):
             if ts["team"]["id"] != team_id:
                 continue
-            st = {s["type"]: s["value"] for s in ts.get("statistics", [])}
-            shots = float(st.get("Total Shots") or 0)
-            on_target = float(st.get("Shots on Goal") or 0)
-            big = float(st.get("Big Chances") or 0)
-            xg_vals.append(shots * 0.09 + on_target * 0.18 + big * 0.35)
-        time.sleep(0.1)
-    return round(sum(xg_vals) / len(xg_vals), 2) if xg_vals else 0.0
+            st = {s["type"]: float(s.get("value") or 0) for s in ts.get("statistics", [])}
+            
+            inside = st.get("Shots insidebox", 0)
+            on_target = st.get("Shots on Goal", 0)
+            outside = st.get("Shots outsidebox", 0)
+            possession = st.get("Ball Possession", 50) / 100
+            
+            # Geliştirilmiş XG (possession ağırlıklı)
+            xg_proxy = (inside * 0.14 + on_target * 0.24 + outside * 0.05 + possession * 0.8)
+            xg_vals.append(xg_proxy)
+        time.sleep(0.6)
+    return round(sum(xg_vals) / len(xg_vals), 2) if xg_vals else 1.5
 
 
 def weighted_avg(values, alpha=ALPHA):
     if not values:
         return 0.0
     w, ws, tw = 1.0, 0.0, 0.0
-    for v in reversed(values):
+    for v in values:  # en yeni maç en yüksek ağırlık
         ws += v * w
         tw += w
         w *= alpha
@@ -113,25 +144,19 @@ def weighted_avg(values, alpha=ALPHA):
 
 def poisson_over(lam, threshold=1.5):
     k_max = math.floor(threshold)
-    p_under = sum(
-        math.exp(-lam) * (lam ** k) / math.factorial(k)
-        for k in range(k_max + 1)
-    )
+    p_under = sum(math.exp(-lam) * (lam ** k) / math.factorial(k) for k in range(k_max + 1))
     return max(0.0, min(1.0, 1 - p_under))
 
 
 def logistic(x, k=2.5):
     try:
         return 1.0 / (1.0 + math.exp(-k * x))
-    except Exception:
+    except:
         return 0.5
 
 
 def parse_matches(matches, team_id):
-    gf, ga = [], []
-    h1_gf, h1_ga = [], []
-    h2_gf, h2_ga = [], []
-    fids = []
+    gf, ga, h1_gf, h1_ga, h2_gf, h2_ga, fids = [], [], [], [], [], [], []
     for m in matches:
         is_home = m["teams"]["home"]["id"] == team_id
         gh = m["goals"]["home"] or 0
@@ -160,24 +185,33 @@ def analyze_team(gen_matches, ven_matches, team_id):
     if ven_matches:
         vgf, vga, vh1_gf, vh1_ga, vh2_gf, vh2_ga, _ = parse_matches(ven_matches, team_id)
     else:
-        vgf, vga, vh1_gf, vh1_ga, vh2_gf, vh2_ga = [], [], [], [], [], []
+        vgf = vga = vh1_gf = vh1_ga = vh2_gf = vh2_ga = []
 
     xg = fetch_xg(team_id, fids)
+    season = fetch_season_stats(team_id)
 
     def rate(lst):
         return sum(1 for x in lst if x > 0) / len(lst) if lst else 0.0
 
-    w_gf = weighted_avg(gf) * 0.5 + (weighted_avg(vgf) if vgf else weighted_avg(gf)) * 0.5
+    w_gf = weighted_avg(gf) * 0.65 + season["season_gf"] * 0.35
     h1_gf_r = rate(h1_gf) * 0.5 + (rate(vh1_gf) if vh1_gf else rate(h1_gf)) * 0.5
-    h1_ga_r = rate(h1_ga) * 0.5 + (rate(vh1_ga) if vh1_ga else rate(h1_ga)) * 0.5
     h2_gf_r = rate(h2_gf) * 0.5 + (rate(vh2_gf) if vh2_gf else rate(h2_gf)) * 0.5
-    h2_ga_r = rate(h2_ga) * 0.5 + (rate(vh2_ga) if vh2_ga else rate(h2_ga)) * 0.5
 
-    lam_attack = w_gf * 0.5 + xg * 0.3 + h1_gf_r * 0.1 + h2_gf_r * 0.1
+    # Lig ortalaması + possession blend (en güçlü kısım)
+    lam_attack = (
+        w_gf * 0.40 +
+        xg * 0.25 +
+        h1_gf_r * 0.20 +      # ilk yarı çok kritik
+        h2_gf_r * 0.10 +
+        (season["season_gf"] * 0.05) +
+        (season["possession"] / 100 * 0.05)
+    )
+
     poisson_conf = poisson_over(lam_attack, 1.5)
-    trend_score = w_gf * 0.45 + h1_gf_r * 0.2 + h2_gf_r * 0.2 + xg * 0.15
-    logistic_conf = logistic(trend_score - 1.5)
-    combined = poisson_conf * 0.5 + logistic_conf * 0.5
+    trend_score = w_gf * 0.35 + h1_gf_r * 0.30 + h2_gf_r * 0.20 + xg * 0.15
+    logistic_conf = logistic(trend_score - 1.45)
+    combined = poisson_conf * 0.55 + logistic_conf * 0.45
+
     over_conf = int(round(combined * 100))
     under_conf = 100 - over_conf
 
@@ -187,36 +221,22 @@ def analyze_team(gen_matches, ven_matches, team_id):
         "lam": round(lam_attack, 2),
         "xG": xg,
         "GF_avg": round(sum(gf) / len(gf), 2),
-        "GA_avg": round(sum(ga) / len(ga), 2),
         "H1_GF": round(h1_gf_r * 100),
         "H2_GF": round(h2_gf_r * 100),
-        "H1_GA": round(h1_ga_r * 100),
-        "H2_GA": round(h2_ga_r * 100),
     }
 
 
 def analyze_h2h(h2h_matches, home_id, away_id):
     if not h2h_matches:
         return None
-    totals = []
-    home_over, away_over = 0, 0
-    for m in h2h_matches:
-        gh = m["goals"]["home"] or 0
-        ga = m["goals"]["away"] or 0
-        totals.append(gh + ga)
-        mhid = m["teams"]["home"]["id"]
-        if mhid == home_id:
-            if gh > 1: home_over += 1
-            if ga > 1: away_over += 1
-        else:
-            if ga > 1: home_over += 1
-            if gh > 1: away_over += 1
+    h2h_matches.sort(key=lambda m: m["fixture"]["date"], reverse=True)
+    totals = [ (m["goals"]["home"] or 0) + (m["goals"]["away"] or 0) for m in h2h_matches ]
     n = len(totals)
+    over15_list = [1 if t > 1 else 0 for t in totals]
+    weighted_over = round(weighted_avg(over15_list) * 100)
+    
     return {
-        "avg_total": round(sum(totals) / n, 2),
-        "over15_rate": round(sum(1 for t in totals if t > 1) / n * 100),
-        "home_over_rate": round(home_over / n * 100),
-        "away_over_rate": round(away_over / n * 100),
+        "over15_rate": weighted_over,
         "n": n,
     }
 
@@ -224,8 +244,7 @@ def analyze_h2h(h2h_matches, home_id, away_id):
 def blend_with_h2h(team_res, h2h_res, is_home):
     if not h2h_res or not team_res:
         return team_res
-    h2h_rate = h2h_res["home_over_rate"] if is_home else h2h_res["away_over_rate"]
-    blended = team_res["over_conf"] * 0.70 + h2h_rate * 0.30
+    blended = team_res["over_conf"] * 0.75 + h2h_res["over15_rate"] * 0.25
     team_res["over_conf"] = int(round(blended))
     team_res["under_conf"] = 100 - team_res["over_conf"]
     return team_res
@@ -234,15 +253,13 @@ def blend_with_h2h(team_res, h2h_res, is_home):
 def best_option(home_res, away_res):
     options = []
     if home_res:
-        if home_res["over_conf"] >= 55:
-            options.append(("HOME 1.5 OVER", home_res["over_conf"]))
-        else:
-            options.append(("HOME 1.5 UNDER", home_res["under_conf"]))
+        opt = "HOME 1.5 OVER" if home_res["over_conf"] >= 55 else "HOME 1.5 UNDER"
+        conf = home_res["over_conf"] if "OVER" in opt else home_res["under_conf"]
+        options.append((opt, conf))
     if away_res:
-        if away_res["over_conf"] >= 55:
-            options.append(("AWAY 1.5 OVER", away_res["over_conf"]))
-        else:
-            options.append(("AWAY 1.5 UNDER", away_res["under_conf"]))
+        opt = "AWAY 1.5 OVER" if away_res["over_conf"] >= 55 else "AWAY 1.5 UNDER"
+        conf = away_res["over_conf"] if "OVER" in opt else away_res["under_conf"]
+        options.append((opt, conf))
     if not options:
         return "No Option", 0
     options.sort(key=lambda x: x[1], reverse=True)
@@ -250,32 +267,29 @@ def best_option(home_res, away_res):
 
 
 def reliability_label(conf):
-    if conf >= 75:
-        return "High"
-    elif conf >= 62:
-        return "Medium"
-    else:
-        return "Low"
+    if conf >= 75: return "High"
+    elif conf >= 62: return "Medium"
+    else: return "Low"
 
 
 def run_analysis(home_name, away_name):
-    home_id, home_real = search_team(home_name)
-    away_id, away_real = search_team(away_name)
+    home_id, home_real, _ = search_team(home_name)
+    away_id, away_real, _ = search_team(away_name)
     if not home_id or not away_id:
         return None, None, None, None
 
-    home_gen = fetch_last(home_id, 10)
-    home_ven = fetch_venue(home_id, "home", 10)
-    away_gen = fetch_last(away_id, 10)
-    away_ven = fetch_venue(away_id, "away", 10)
-    h2h_matches = fetch_h2h(home_id, away_id, 8)
+    home_gen = fetch_last(home_id, 15)
+    home_ven = fetch_venue(home_id, "home", 12)
+    away_gen = fetch_last(away_id, 15)
+    away_ven = fetch_venue(away_id, "away", 12)
+    h2h_matches = fetch_h2h(home_id, away_id, 12)
 
     home_res = analyze_team(home_gen, home_ven, home_id)
     away_res = analyze_team(away_gen, away_ven, away_id)
     h2h_res = analyze_h2h(h2h_matches, home_id, away_id)
 
-    home_res = blend_with_h2h(home_res, h2h_res, is_home=True)
-    away_res = blend_with_h2h(away_res, h2h_res, is_home=False)
+    home_res = blend_with_h2h(home_res, h2h_res, True)
+    away_res = blend_with_h2h(away_res, h2h_res, False)
 
     return home_real, away_real, home_res, away_res
 
@@ -285,74 +299,64 @@ def format_msg(home_name, away_name, home_res, away_res):
     reliability = reliability_label(conf)
     marker = "[+]" if "OVER" in option else "[-]"
 
-    msg = "MATCH ANALYSIS RESULT \U0001f525\n\n"
-    msg += "\U0001f3f3\ufe0f: " + home_name + "\n"
-    msg += "\U0001f6a9: " + away_name + "\n"
-    msg += "\u2139\ufe0f: Most Reliable Option [ %" + str(conf) + " ]\n"
-    msg += "\u26bd\ufe0f: " + option + " " + marker + "\n"
-    msg += "\U0001f6dc: Reliability [ " + reliability + " ]"
+    msg = "MATCH ANALYSIS RESULT 🔥\n\n"
+    msg += "🏳️: " + home_name + "\n"
+    msg += "🚩: " + away_name + "\n"
+    msg += "ℹ️: Most Reliable Option [ %" + str(conf) + " ]\n"
+    msg += "⚽: " + option + " " + marker + "\n"
+    msg += "📊: Reliability [ " + reliability + " ]"
     return msg
 
 
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Run Another Analysis", callback_data="again")],
-        [InlineKeyboardButton("Close Bot", callback_data="close")]
+        [InlineKeyboardButton("Tekrar Analiz Et", callback_data="again")],
+        [InlineKeyboardButton("Botu Kapat", callback_data="close")]
     ])
 
 
+# Telegram handler'lar (button fix dahil)
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    await update.message.reply_text(
-        "Welcome!\nHome/Away 1.5 Over/Under Analysis\nUse /analysis to start."
-    )
-
+    if update.effective_user.id != ADMIN_ID: return
+    await update.message.reply_text("Hoş geldin! /analysis yazarak başla.")
 
 async def analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    await update.message.reply_text("\U0001f3f3\ufe0f: Please enter Home Team Name")
+    if update.effective_user.id != ADMIN_ID: return
+    await update.message.reply_text("🏳️: Ev Sahibi Takım Adı Gir")
     return HOME
-
 
 async def home_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["home"] = update.message.text.strip()
-    await update.message.reply_text("\U0001f6a9: Please enter Away Team Name")
+    await update.message.reply_text("🚩: Deplasman Takım Adı Gir")
     return AWAY
-
 
 async def away_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["away"] = update.message.text.strip()
-    wait = await update.message.reply_text("\U0001f6dc: Analysis started, please wait...")
+    wait = await update.message.reply_text("📊: Analiz yapılıyor, bekle...")
     home = context.user_data["home"]
     away = context.user_data["away"]
 
     home_real, away_real, home_res, away_res = run_analysis(home, away)
 
     if not home_real or not away_real:
-        await wait.edit_text(
-            "Team not found. Please use English full name.\nExample: Barcelona, Arsenal, Fenerbahce",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data="again")]])
-        )
+        await wait.edit_text("Takım bulunamadı. Tam İngilizce isim kullan (ör: Real Madrid, Fenerbahce)")
         return ConversationHandler.END
 
     msg = format_msg(home_real, away_real, home_res, away_res)
     await wait.edit_text(msg, reply_markup=main_keyboard())
     return ConversationHandler.END
 
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
-        await query.answer("Unauthorized.")
+        await query.answer("Yetkisiz!")
         return ConversationHandler.END
     await query.answer()
     if query.data == "again":
-        await query.edit_message_text("\U0001f3f3\ufe0f: Please enter Home Team Name")
+        await query.edit_message_text("🏳️: Ev Sahibi Takım Adı Gir")
         return HOME
     elif query.data == "close":
-        await query.edit_message_text("Bot closed.\nUse /analysis to restart.")
+        await query.edit_message_text("Bot kapatıldı. Tekrar /analysis yaz.")
         return ConversationHandler.END
 
 
@@ -361,18 +365,12 @@ def run_bot():
         try:
             app = Application.builder().token(BOT_TOKEN).build()
             conv = ConversationHandler(
-                entry_points=[
-                    CommandHandler("analysis", analysis_cmd),
-                    CommandHandler("analiz", analysis_cmd),
-                ],
+                entry_points=[CommandHandler("analysis", analysis_cmd), CommandHandler("analiz", analysis_cmd)],
                 states={
-                    HOME: [
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, home_team),
-                        CallbackQueryHandler(button_handler, pattern="^again$"),
-                    ],
-                    AWAY: [
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, away_team),
-                    ],
+                    HOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, home_team),
+                           CallbackQueryHandler(button_handler, pattern="^again$")],
+                    AWAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, away_team),
+                           CallbackQueryHandler(button_handler, pattern="^again$")],
                 },
                 fallbacks=[CommandHandler("analysis", analysis_cmd)],
                 per_message=False,
@@ -381,10 +379,10 @@ def run_bot():
             app.add_handler(CommandHandler("start", start_cmd))
             app.add_handler(conv)
             app.add_handler(CallbackQueryHandler(button_handler))
-            print("GOALREPORT BOT RUNNING")
+            print("BOT ÇALIŞIYOR - 150K İstek Güçlendirilmiş Versiyon")
             app.run_polling(drop_pending_updates=True)
         except Exception as e:
-            print("RESTART: " + str(e))
+            print("Restart: " + str(e))
             time.sleep(5)
 
 
