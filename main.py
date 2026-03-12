@@ -24,14 +24,12 @@ def safe_get(url):
         try:
             r = requests.get(url, headers=headers, timeout=15)
             if r.status_code == 200:
-                if "x-ratelimit-requests-remaining" in r.headers:
-                    remaining = int(r.headers["x-ratelimit-requests-remaining"])
-                    if remaining < 5000:
-                        time.sleep(2)
                 return r.json()
-        except Exception:
-            pass
-        time.sleep(0.8)
+            else:
+                print(f"API error {r.status_code} for {url}")
+        except Exception as e:
+            print(f"Request exception: {e}")
+        time.sleep(1)
     return None
 
 
@@ -43,26 +41,13 @@ def search_team(name):
     return team["id"], team["name"]
 
 
-def fetch_season_stats(team_id):
-    r = safe_get(API_URL + f"/teams/statistics?team={team_id}&season=2025")
-    if not r or not r.get("response"):
-        return {"season_gf": 1.5, "season_ga": 1.4, "possession": 50}
-    
-    resp = r["response"]
-    season_gf = float(resp.get("goals", {}).get("for", {}).get("average", {}).get("total") or 1.5)
-    season_ga = float(resp.get("goals", {}).get("against", {}).get("average", {}).get("total") or 1.4)
-    poss = float(resp.get("possession") or 50)
-    
-    return {"season_gf": round(season_gf, 2), "season_ga": round(season_ga, 2), "possession": poss}
-
-
 def fetch_last(team_id, n=15):
-    r = safe_get(API_URL + "/fixtures?team=" + str(team_id) + "&last=" + str(n) + "&status=FT")
+    r = safe_get(API_URL + f"/fixtures?team={team_id}&last={n}&status=FT")
     return r.get("response", []) if r else []
 
 
 def fetch_venue(team_id, venue="home", n=12):
-    r = safe_get(API_URL + "/fixtures?team=" + str(team_id) + "&last=30&status=FT")
+    r = safe_get(API_URL + f"/fixtures?team={team_id}&last=30&status=FT")
     if not r:
         return []
     result = []
@@ -77,7 +62,7 @@ def fetch_venue(team_id, venue="home", n=12):
 
 
 def fetch_h2h(id1, id2, n=12):
-    r = safe_get(API_URL + "/fixtures/headtohead?h2h=" + str(id1) + "-" + str(id2) + "&last=" + str(n))
+    r = safe_get(API_URL + f"/fixtures/headtohead?h2h={id1}-{id2}&last={n}")
     if not r:
         return []
     cutoff = datetime(2025, 1, 1, tzinfo=timezone.utc)
@@ -96,34 +81,37 @@ def fetch_h2h(id1, id2, n=12):
 
 def fetch_xg(team_id, fixture_ids):
     xg_vals = []
-    for fid in fixture_ids[:10]:
-        r = safe_get(API_URL + "/fixtures/statistics?fixture=" + str(fid) + "&team=" + str(team_id))
+    for fid in fixture_ids[:8]:  # 10 yerine 8, kota dostu
+        r = safe_get(API_URL + f"/fixtures/statistics?fixture={fid}&team={team_id}")
         if not r:
             continue
         for ts in r.get("response", []):
-            if ts["team"]["id"] != team_id:
+            if ts.get("team", {}).get("id") != team_id:
                 continue
-            st = {s["type"]: float(s.get("value") or 0) for s in ts.get("statistics", [])}
+            st = {s["type"]: s.get("value") for s in ts.get("statistics", [])}
             
-            inside = st.get("Shots insidebox", 0)
-            on_target = st.get("Shots on Goal", 0)
-            outside = st.get("Shots outsidebox", 0)
-            possession = st.get("Ball Possession", 50) / 100 if "Ball Possession" in st else 0.5
+            inside = float(st.get("Shots insidebox") or 0)
+            on_target = float(st.get("Shots on Goal") or 0)
+            outside = float(st.get("Shots outsidebox") or 0)
             
-            xg_proxy = (inside * 0.14 + on_target * 0.24 + outside * 0.05 + possession * 0.8)
+            # Ball Possession "%58" gibi geliyor → temizle
+            poss_str = st.get("Ball Possession", "0%")
+            poss = float(poss_str.replace("%", "")) / 100 if "%" in poss_str else 0.5
+            
+            xg_proxy = (inside * 0.14 + on_target * 0.24 + outside * 0.05 + poss * 0.8)
             xg_vals.append(xg_proxy)
-        time.sleep(0.6)
+        time.sleep(0.7)
     return round(sum(xg_vals) / len(xg_vals), 2) if xg_vals else 1.5
 
 
 def weighted_avg(values, alpha=ALPHA):
     if not values:
         return 0.0
-    w, ws, tw = 1.0, 0.0, 0.0
+    w = ws = tw = 0.0
     for v in values:
+        w = w * alpha + 1
         ws += v * w
         tw += w
-        w *= alpha
     return ws / tw if tw > 0 else 0.0
 
 
@@ -141,14 +129,17 @@ def logistic(x, k=2.5):
 
 
 def parse_matches(matches, team_id):
-    gf, ga, h1_gf, h1_ga, h2_gf, h2_ga, fids = [], [], [], [], [], [], []
+    gf, ga = [], []
+    h1_gf, h1_ga = [], []
+    h2_gf, h2_ga = [], []
+    fids = []
     for m in matches:
         is_home = m["teams"]["home"]["id"] == team_id
         gh = m["goals"]["home"] or 0
-        ga_ = m["goals"]["away"] or 0
+        ga_val = m["goals"]["away"] or 0
         h1h = m.get("score", {}).get("halftime", {}).get("home") or 0
         h1a = m.get("score", {}).get("halftime", {}).get("away") or 0
-        scored, conceded = (gh, ga_) if is_home else (ga_, gh)
+        scored, conceded = (gh, ga_val) if is_home else (ga_val, gh)
         h1s, h1c = (h1h, h1a) if is_home else (h1a, h1h)
         h2s = max(0, scored - h1s)
         h2c = max(0, conceded - h1c)
@@ -173,28 +164,19 @@ def analyze_team(gen_matches, ven_matches, team_id):
         vgf = vga = vh1_gf = vh1_ga = vh2_gf = vh2_ga = []
 
     xg = fetch_xg(team_id, fids)
-    season = fetch_season_stats(team_id)
 
     def rate(lst):
         return sum(1 for x in lst if x > 0) / len(lst) if lst else 0.0
 
-    w_gf = weighted_avg(gf) * 0.65 + season["season_gf"] * 0.35
+    w_gf = weighted_avg(gf) * 0.6 + (weighted_avg(vgf) if vgf else weighted_avg(gf)) * 0.4
     h1_gf_r = rate(h1_gf) * 0.5 + (rate(vh1_gf) if vh1_gf else rate(h1_gf)) * 0.5
     h2_gf_r = rate(h2_gf) * 0.5 + (rate(vh2_gf) if vh2_gf else rate(h2_gf)) * 0.5
 
-    lam_attack = (
-        w_gf * 0.40 +
-        xg * 0.25 +
-        h1_gf_r * 0.20 +
-        h2_gf_r * 0.10 +
-        (season["season_gf"] * 0.03) +
-        (season["possession"] / 100 * 0.02)
-    )
-
+    lam_attack = w_gf * 0.45 + xg * 0.30 + h1_gf_r * 0.15 + h2_gf_r * 0.10
     poisson_conf = poisson_over(lam_attack, 1.5)
-    trend_score = w_gf * 0.35 + h1_gf_r * 0.30 + h2_gf_r * 0.20 + xg * 0.15
+    trend_score = w_gf * 0.40 + h1_gf_r * 0.25 + h2_gf_r * 0.20 + xg * 0.15
     logistic_conf = logistic(trend_score - 1.45)
-    combined = poisson_conf * 0.55 + logistic_conf * 0.45
+    combined = poisson_conf * 0.60 + logistic_conf * 0.40
 
     over_conf = int(round(combined * 100))
     under_conf = 100 - over_conf
@@ -213,19 +195,17 @@ def analyze_team(gen_matches, ven_matches, team_id):
 def analyze_h2h(h2h_matches, home_id, away_id):
     if not h2h_matches:
         return None
-    h2h_matches.sort(key=lambda m: m["fixture"]["date"], reverse=True)
     totals = [(m["goals"]["home"] or 0) + (m["goals"]["away"] or 0) for m in h2h_matches]
     n = len(totals)
     over15_list = [1 if t > 1 else 0 for t in totals]
     weighted_over = round(weighted_avg(over15_list) * 100)
-    
     return {"over15_rate": weighted_over, "n": n}
 
 
 def blend_with_h2h(team_res, h2h_res, is_home):
     if not h2h_res or not team_res:
         return team_res
-    blended = team_res["over_conf"] * 0.75 + h2h_res["over15_rate"] * 0.25
+    blended = team_res["over_conf"] * 0.80 + h2h_res["over15_rate"] * 0.20
     team_res["over_conf"] = int(round(blended))
     team_res["under_conf"] = 100 - team_res["over_conf"]
     return team_res
@@ -254,25 +234,29 @@ def reliability_label(conf):
 
 
 def run_analysis(home_name, away_name):
-    home_id, home_real = search_team(home_name)
-    away_id, away_real = search_team(away_name)
-    if not home_id or not away_id:
+    try:
+        home_id, home_real = search_team(home_name)
+        away_id, away_real = search_team(away_name)
+        if not home_id or not away_id:
+            return None, None, None, None
+
+        home_gen = fetch_last(home_id, 15)
+        home_ven = fetch_venue(home_id, "home", 12)
+        away_gen = fetch_last(away_id, 15)
+        away_ven = fetch_venue(away_id, "away", 12)
+        h2h_matches = fetch_h2h(home_id, away_id, 12)
+
+        home_res = analyze_team(home_gen, home_ven, home_id)
+        away_res = analyze_team(away_gen, away_ven, away_id)
+        h2h_res = analyze_h2h(h2h_matches, home_id, away_id)
+
+        home_res = blend_with_h2h(home_res, h2h_res, True)
+        away_res = blend_with_h2h(away_res, h2h_res, False)
+
+        return home_real, away_real, home_res, away_res
+    except Exception as e:
+        print(f"run_analysis error: {e}")
         return None, None, None, None
-
-    home_gen = fetch_last(home_id, 15)
-    home_ven = fetch_venue(home_id, "home", 12)
-    away_gen = fetch_last(away_id, 15)
-    away_ven = fetch_venue(away_id, "away", 12)
-    h2h_matches = fetch_h2h(home_id, away_id, 12)
-
-    home_res = analyze_team(home_gen, home_ven, home_id)
-    away_res = analyze_team(away_gen, away_ven, away_id)
-    h2h_res = analyze_h2h(h2h_matches, home_id, away_id)
-
-    home_res = blend_with_h2h(home_res, h2h_res, True)
-    away_res = blend_with_h2h(away_res, h2h_res, False)
-
-    return home_real, away_real, home_res, away_res
 
 
 def format_msg(home_name, away_name, home_res, away_res):
@@ -281,8 +265,8 @@ def format_msg(home_name, away_name, home_res, away_res):
     marker = "[+]" if "OVER" in option else "[-]"
 
     msg = "MATCH ANALYSIS RESULT 🔥\n\n"
-    msg += "🏠: " + home_name + "\n"
-    msg += "🚩: " + away_name + "\n"
+    msg += "🏠 " + home_name + "\n"
+    msg += "🚩 " + away_name + "\n"
     msg += "ℹ️ Most Reliable Option [% " + str(conf) + " ]\n"
     msg += "⚽ " + option + " " + marker + "\n"
     msg += "📊 Reliability [" + reliability + "]"
@@ -299,9 +283,7 @@ def main_keyboard():
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    await update.message.reply_text(
-        "Welcome!\nHome/Away 1.5 Over/Under Analysis\nUse /analysis to start."
-    )
+    await update.message.reply_text("Welcome! Use /analysis to start.")
 
 
 async def analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -319,21 +301,31 @@ async def home_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def away_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["away"] = update.message.text.strip()
-    wait = await update.message.reply_text("🛜 Analyzing, please wait...")
-    home = context.user_data["home"]
-    away = context.user_data["away"]
-
-    home_real, away_real, home_res, away_res = run_analysis(home, away)
-
-    if not home_real or not away_real or not home_res or not away_res:
-        await wait.edit_text(
-            "Team not found or API error.\nPlease use full English team names.\nExample: Real Madrid, Manchester City, Fenerbahce",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data="again")]])
-        )
+    wait_msg = await update.message.reply_text("🛜 Analyzing, please wait...")
+    
+    home = context.user_data.get("home")
+    away = context.user_data.get("away")
+    
+    if not home or not away:
+        await wait_msg.edit_text("Error: Team names missing. Try /analysis again.")
         return ConversationHandler.END
 
-    msg = format_msg(home_real, away_real, home_res, away_res)
-    await wait.edit_text(msg, reply_markup=main_keyboard())
+    try:
+        home_real, away_real, home_res, away_res = run_analysis(home, away)
+
+        if not home_real or not away_real or not home_res or not away_res:
+            await wait_msg.edit_text(
+                "Team not found or API issue.\nUse full English names (e.g. Real Madrid, AS Roma, FC Porto, VfB Stuttgart)",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data="again")]])
+            )
+            return ConversationHandler.END
+
+        msg = format_msg(home_real, away_real, home_res, away_res)
+        await wait_msg.edit_text(msg, reply_markup=main_keyboard())
+    except Exception as e:
+        print(f"away_team error: {e}")
+        await wait_msg.edit_text("Analysis failed. Please try again or check console logs.")
+    
     return ConversationHandler.END
 
 
@@ -347,7 +339,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🏠 Please enter Home Team Name")
         return HOME
     elif query.data == "close":
-        await query.edit_message_text("Bot closed.\nUse /analysis to restart.")
+        await query.edit_message_text("Bot closed. Use /analysis to restart.")
         return ConversationHandler.END
 
 
@@ -356,31 +348,23 @@ def run_bot():
         try:
             app = Application.builder().token(BOT_TOKEN).build()
             conv = ConversationHandler(
-                entry_points=[
-                    CommandHandler("analysis", analysis_cmd),
-                    CommandHandler("analiz", analysis_cmd),
-                ],
+                entry_points=[CommandHandler("analysis", analysis_cmd)],
                 states={
-                    HOME: [
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, home_team),
-                        CallbackQueryHandler(button_handler, pattern="^again$"),
-                    ],
-                    AWAY: [
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, away_team),
-                        CallbackQueryHandler(button_handler, pattern="^again$"),
-                    ],
+                    HOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, home_team),
+                           CallbackQueryHandler(button_handler, pattern="^again$")],
+                    AWAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, away_team),
+                           CallbackQueryHandler(button_handler, pattern="^again$")],
                 },
                 fallbacks=[CommandHandler("analysis", analysis_cmd)],
-                per_message=False,
                 allow_reentry=True,
             )
             app.add_handler(CommandHandler("start", start_cmd))
             app.add_handler(conv)
             app.add_handler(CallbackQueryHandler(button_handler))
-            print("GOALREPORT BOT RUNNING - English Messages")
+            print("BOT STARTED - Fixed Version")
             app.run_polling(drop_pending_updates=True)
         except Exception as e:
-            print("RESTART: " + str(e))
+            print(f"Bot restart: {e}")
             time.sleep(5)
 
 
